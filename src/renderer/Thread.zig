@@ -60,6 +60,11 @@ const DRAW_INTERVAL = 8; // 120 FPS
 const CURSOR_BLINK_INTERVAL = 600;
 const RENDER_FOLLOWUP_BURST_MS = 128;
 
+/// How long `send` waits for room in a full mailbox before dropping the
+/// message. Long enough that a woken renderer will have drained the queue,
+/// short enough that the app thread never visibly stalls.
+const SEND_TIMEOUT_MS = 100;
+
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
 /// If this is `true` then we send a `redraw_surface` message to the apprt
@@ -387,6 +392,55 @@ fn syncDrawTimer(self: *Thread) void {
         self,
         drawCallback,
     );
+}
+
+/// Send a message to this thread, waking it so the message gets drained.
+///
+/// This is the only safe way to message the renderer from the app thread.
+/// A plain `mailbox.push(msg, .forever)` can wedge the caller permanently:
+/// the mailbox is only drained after a wakeup, so a full queue parks the
+/// sender on `cond_not_full` *before* it reaches the code that would wake
+/// the thread responsible for draining it. On Win32 the app thread runs the
+/// window procedure for every window in the process, so that stall freezes
+/// the entire application rather than one surface.
+///
+/// We therefore notify first and then bound the wait. Returns false if the
+/// mailbox stayed full and the message had to be dropped.
+pub fn send(self: *Thread, msg: rendererpkg.Message) bool {
+    // Wake before we wait. A full mailbox is only emptied after a wakeup,
+    // so waiting first can park us behind a queue nobody has been told to
+    // drain. This is the notify that prevents the deadlock.
+    self.notify();
+
+    const sent = self.mailbox.push(msg, .{
+        .ns = SEND_TIMEOUT_MS * std.time.ns_per_ms,
+    }) != 0;
+
+    if (!sent) {
+        log.warn(
+            "renderer mailbox full, dropping message={s}",
+            .{@tagName(std.meta.activeTag(msg))},
+        );
+
+        // We own the message now that nobody will drain it. Note this
+        // does not cover `.font_grid`, which has no deinit: dropping one
+        // leaks a grid reference. That only happens when the renderer is
+        // already wedged, and a leak beats freezing every window.
+        msg.deinit();
+    }
+
+    // Wake again for the message we just queued. The pre-push notify may
+    // already have been consumed by a drain that ran before our push
+    // landed, which would leave this message sitting until the next wakeup.
+    self.notify();
+
+    return sent;
+}
+
+fn notify(self: *Thread) void {
+    self.wakeup.notify() catch |err| {
+        log.warn("error notifying renderer thread err={}", .{err});
+    };
 }
 
 /// Drain the mailbox.

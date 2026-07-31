@@ -59,6 +59,10 @@ const darwin = if (builtin.os.tag.isDarwin()) struct {
 /// we hold the terminal lock too often.
 const REFRESH_INTERVAL = 24; // 40 FPS
 
+/// How long `send` waits for room in a full mailbox before dropping the
+/// message. See `send`.
+const SEND_TIMEOUT_MS = 100;
+
 fn shouldRunRefreshTimer(has_search: bool, visible: bool, focused: bool) bool {
     return has_search and visible and focused;
 }
@@ -267,6 +271,46 @@ fn threadMain_(self: *Thread) !void {
         // and then we'll block on the loop next time.
         try self.loop.run(.no_wait);
     }
+}
+
+/// Send a message to this thread, waking it so the message gets drained.
+///
+/// This is the only safe way to message the search thread from the app
+/// thread. See `renderer.Thread.send` for why a blocking push can deadlock
+/// the caller: the mailbox is only drained after a wakeup, so a full queue
+/// parks the sender before it can wake the draining thread.
+///
+/// Returns false if the mailbox stayed full and the message was dropped.
+pub fn send(self: *Thread, msg: Message) bool {
+    // Wake before we wait, so a full mailbox is already being drained by
+    // the time we block on it. This is what prevents the deadlock.
+    self.notify();
+
+    const sent = self.mailbox.push(msg, .{
+        .ns = SEND_TIMEOUT_MS * std.time.ns_per_ms,
+    }) != 0;
+
+    if (!sent) {
+        log.warn(
+            "search mailbox full, dropping message={s}",
+            .{@tagName(std.meta.activeTag(msg))},
+        );
+
+        // We own the message now that nobody will drain it.
+        msg.deinit();
+    }
+
+    // Wake again for the message we just queued, in case the pre-push
+    // notify was consumed by a drain that ran before our push landed.
+    self.notify();
+
+    return sent;
+}
+
+fn notify(self: *Thread) void {
+    self.wakeup.notify() catch |err| {
+        log.warn("error notifying search thread err={}", .{err});
+    };
 }
 
 /// Drain the mailbox.
@@ -618,6 +662,16 @@ pub const Message = union(enum) {
 
     /// Surface focus changed.
     focus: bool,
+
+    /// Release any resources owned by this message. Only needed for
+    /// messages that were never delivered; the thread frees what it
+    /// handles as it drains.
+    pub fn deinit(self: *const Message) void {
+        switch (self.*) {
+            .change_query => |v| v.req.deinit(),
+            else => {},
+        }
+    }
 };
 
 /// Events that can be emitted from the search thread. The caller
