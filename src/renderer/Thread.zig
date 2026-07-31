@@ -65,6 +65,11 @@ const RENDER_FOLLOWUP_BURST_MS = 128;
 /// short enough that the app thread never visibly stalls.
 const SEND_TIMEOUT_MS = 100;
 
+/// How often a visible but unfocused surface re-renders. Fast enough that
+/// monitoring output (`htop`, `tail -f`) on a background window stays
+/// useful, slow enough to be a rounding error next to the focused cadence.
+const UNFOCUSED_HEARTBEAT_MS = 250;
+
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
 /// If this is `true` then we send a `redraw_surface` message to the apprt
@@ -122,6 +127,19 @@ cursor_c: xev.Completion = .{},
 /// completed timer remains `.active` until its callback is popped, so reusing
 /// it from another callback can corrupt libxev's intrusive completion queue.
 cursor_blink_reset_at: ?std.time.Instant = null,
+
+/// The timer that keeps a visible but unfocused surface updating.
+///
+/// A focused surface is driven by the cursor blink timer, which forces a
+/// full `renderOnce` several times a second. That timer is disarmed on focus
+/// loss, which leaves an unfocused surface depending entirely on wakeups
+/// from the IO thread -- and those coalesce heavily on Win32. When they
+/// coalesce away, a visible-but-unfocused window stops showing new output
+/// (a `tail -f` or `htop` on a second monitor appears frozen) and, because
+/// `drainMailbox` only runs inside `renderOnce`, its mailbox stops being
+/// drained too. See `syncUnfocusedHeartbeat`.
+heartbeat_h: xev.Timer,
+heartbeat_c: xev.Completion = .{},
 
 /// The surface we're rendering to.
 surface: *apprt.Surface,
@@ -214,6 +232,10 @@ pub fn init(
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
 
+    // Heartbeat for visible but unfocused surfaces, see comments.
+    var heartbeat_h = try xev.Timer.init();
+    errdefer heartbeat_h.deinit();
+
     // The mailbox for messaging this thread
     var mailbox = try Mailbox.create(alloc);
     errdefer mailbox.destroy(alloc);
@@ -228,6 +250,7 @@ pub fn init(
         .draw_h = draw_h,
         .draw_now = draw_now,
         .cursor_h = cursor_timer,
+        .heartbeat_h = heartbeat_h,
         .surface = surface,
         .search_generation = search_generation,
         .renderer = renderer_impl,
@@ -246,6 +269,7 @@ pub fn deinit(self: *Thread) void {
     self.draw_h.deinit();
     self.draw_now.deinit();
     self.cursor_h.deinit();
+    self.heartbeat_h.deinit();
     self.loop.deinit();
 
     // Nothing can possibly access the mailbox anymore, destroy it.
@@ -312,6 +336,10 @@ fn threadMain_(self: *Thread) !void {
 
     // Start the draw timer
     self.syncDrawTimer();
+
+    // Surfaces can start life unfocused (a window opened in the background),
+    // in which case the cursor timer above will disarm on its first tick.
+    self.syncUnfocusedHeartbeat();
 
     // Run
     log.debug("starting renderer thread", .{});
@@ -479,6 +507,10 @@ fn drainMailbox(self: *Thread) !bool {
 
                 // Visibility changes can suppress or restart animation draws.
                 self.syncDrawTimer();
+
+                // A surface that just became visible while unfocused needs
+                // the heartbeat to keep it updating.
+                self.syncUnfocusedHeartbeat();
             },
 
             .focus => |v| focus: {
@@ -496,6 +528,10 @@ fn drainMailbox(self: *Thread) !bool {
 
                 // We always resync our draw timer (may disable it)
                 self.syncDrawTimer();
+
+                // Losing focus disarms the cursor timer below, so the
+                // heartbeat has to take over driving renders.
+                self.syncUnfocusedHeartbeat();
 
                 if (!v) {
                     // Let an already-queued one-shot timer expire and disarm
@@ -641,6 +677,76 @@ fn scheduleRenderFollowup(self: *Thread) void {
         self,
         renderCallback,
     );
+}
+
+fn shouldRunUnfocusedHeartbeat(self: *const Thread) bool {
+    return self.flags.visible and !self.flags.focused;
+}
+
+/// Keep a visible but unfocused surface rendering.
+///
+/// Arms the heartbeat when the surface is visible and unfocused. There is no
+/// disarm path here on purpose: cancelling a live completion is unsafe on
+/// IOCP, so a running heartbeat retires itself from its own callback once
+/// the surface regains focus or goes invisible.
+fn syncUnfocusedHeartbeat(self: *Thread) void {
+    if (!self.shouldRunUnfocusedHeartbeat()) return;
+
+    // Same IOCP constraint as the cursor timer: `.active` can mean
+    // "completed but not yet popped", so only arm a completion libxev has
+    // fully released.
+    if (self.heartbeat_c.state() != .dead) return;
+
+    self.heartbeat_h.run(
+        &self.loop,
+        &self.heartbeat_c,
+        UNFOCUSED_HEARTBEAT_MS,
+        Thread,
+        self,
+        heartbeatCallback,
+    );
+}
+
+fn heartbeatCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        // Sent when the timer is canceled, which is fine.
+        error.Canceled => return .disarm,
+        else => {
+            log.warn("error in unfocused heartbeat callback err={}", .{err});
+            return .disarm;
+        },
+    };
+
+    const t: *Thread = self_ orelse {
+        log.warn("heartbeat callback fired without data set", .{});
+        return .disarm;
+    };
+
+    // Retire if we regained focus or went invisible. Focus regain rearms the
+    // cursor timer, which takes over driving renders from here.
+    if (!t.shouldRunUnfocusedHeartbeat()) return .disarm;
+
+    // A full renderOnce, not drawFrame: we need updateFrame to pull new
+    // terminal content in, and drainMailbox to run.
+    _ = t.renderOnce(false);
+
+    // Rearm. Safe from inside the callback because libxev has released the
+    // completion by the time we're called.
+    t.heartbeat_h.run(
+        &t.loop,
+        &t.heartbeat_c,
+        UNFOCUSED_HEARTBEAT_MS,
+        Thread,
+        t,
+        heartbeatCallback,
+    );
+
+    return .disarm;
 }
 
 /// Arm the cursor's one-shot timer only when libxev no longer owns the
